@@ -195,8 +195,9 @@ COPY backend/backend.proto /${BACKEND}/backend.proto
 COPY backend/python/common/ /${BACKEND}/common
 COPY scripts/build/package-gpu-libs.sh /package-gpu-libs.sh
 
-# Optional per-backend source build toggle (e.g. vllm on CPU needs to
-# compile against the host SIMD instead of using the prebuilt wheel).
+# Optional per-backend source build toggle (e.g. vllm on CPU can set
+# FROM_SOURCE=true to compile against the build host SIMD instead of
+# pulling a prebuilt wheel). Default empty — most backends ignore it.
 ARG FROM_SOURCE=""
 ENV FROM_SOURCE=${FROM_SOURCE}
 

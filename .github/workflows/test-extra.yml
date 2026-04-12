@@ -505,8 +505,12 @@ jobs:
   tests-vllm-grpc:
     needs: detect-changes
     if: needs.detect-changes.outputs.vllm == 'true' || needs.detect-changes.outputs.run-all == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The prebuilt vllm CPU wheel is compiled with AVX-512 VNNI/BF16
+    # instructions; stock ubuntu-latest runners SIGILL on import of
+    # vllm.model_executor.models.registry. bigger-runner has newer
+    # hardware that supports the required SIMD.
+    runs-on: bigger-runner
+    timeout-minutes: 90
     steps:
       - name: Clone
         uses: actions/checkout@v6
@@ -521,12 +525,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
           df -h
       - name: Build vllm (cpu) backend image and run gRPC e2e tests
-        env:
-          # GitHub Actions runners don't all support the SIMD instructions
-          # the prebuilt vllm CPU wheel was compiled against (SIGILL in
-          # vllm.model_executor.models.registry on import). Build vllm from
-          # source so it targets the actual CI CPU.
-          FROM_SOURCE: "true"
         run: |
           make test-extra-backend-vllm
   tests-acestep-cpp:

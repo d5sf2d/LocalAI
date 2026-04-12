@@ -32,12 +32,12 @@ if [ "x${BUILD_PROFILE}" == "xcpu" ]; then
     EXTRA_PIP_INSTALL_FLAGS+=" --index-strategy=unsafe-best-match"
 fi
 
-# When FROM_SOURCE=true on a CPU build, skip the prebuilt wheel in
-# requirements-cpu-after.txt and compile vllm locally against the host's
-# actual CPU. The prebuilt CPU wheels from vllm releases are compiled with
-# wider SIMD (AVX-512 VNNI/BF16 etc.) than some environments support — in
-# particular GitHub Actions runners SIGILL on the vllm model registry
-# subprocess. FROM_SOURCE=true avoids that at the cost of a longer install.
+# FROM_SOURCE=true on a CPU build skips the prebuilt vllm wheel in
+# requirements-cpu-after.txt and compiles vllm locally against the host's
+# actual CPU. Not used by default because it takes ~30-40 minutes, but
+# kept here for hosts where the prebuilt wheel SIGILLs (CPU without the
+# required SIMD baseline, e.g. AVX-512 VNNI/BF16). Default CI uses a
+# bigger-runner with compatible hardware instead.
 if [ "x${BUILD_TYPE}" == "x" ] && [ "x${FROM_SOURCE:-}" == "xtrue" ]; then
     # Temporarily hide the prebuilt wheel so installRequirements doesn't
     # pull it — the rest of the requirements files (base deps, torch,

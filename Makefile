@@ -509,11 +509,10 @@ test-extra-backend-ik-llama-cpp: docker-build-ik-llama-cpp
 
 ## vllm is resolved from a HuggingFace model id (no file download) and
 ## exercises Predict + streaming + tool-call extraction via the hermes parser.
-## FROM_SOURCE=true passes through to Dockerfile.python → install.sh and
-## compiles vllm locally instead of using the prebuilt CPU wheel — required
-## on runners whose CPU doesn't support the wheel's baked-in SIMD.
-test-extra-backend-vllm:
-	$(MAKE) docker-build-vllm
+## Requires a host CPU with the SIMD instructions the prebuilt vllm CPU
+## wheel was compiled against (AVX-512 VNNI/BF16); older CPUs will SIGILL
+## on import — on CI this means using the bigger-runner label.
+test-extra-backend-vllm: docker-build-vllm
 	BACKEND_IMAGE=local-ai-backend:vllm \
 	BACKEND_TEST_MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct \
 	BACKEND_TEST_CAPS=health,load,predict,stream,tools \
