@@ -68,40 +68,147 @@ func NewDistributedBackendManager(appConfig *config.ApplicationConfig, ml *model
 	}
 }
 
+// NodeOpStatus is the per-node outcome of a backend lifecycle operation.
+// Returned as part of BackendOpResult so the frontend can surface exactly
+// what happened on each worker instead of a single joined error string.
+type NodeOpStatus struct {
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+	Status   string `json:"status"` // "success" | "queued" | "error"
+	Error    string `json:"error,omitempty"`
+}
+
+// BackendOpResult aggregates per-node outcomes.
+type BackendOpResult struct {
+	Nodes []NodeOpStatus `json:"nodes"`
+}
+
+// enqueueAndDrainBackendOp is the shared scaffolding for
+// delete/install/upgrade. Every non-pending node gets a pending_backend_ops
+// row (intent is durable even if the node is offline). Currently-healthy
+// nodes get an immediate attempt; success deletes the row, failure records
+// the error and leaves the row for the reconciler to retry.
+//
+// `apply` is the NATS round-trip for one node. Returning an error keeps the
+// row in the queue and marks the per-node status as "error"; returning nil
+// deletes the row and reports "success". For non-healthy nodes the status
+// is "queued" — no attempt is made right now, reconciler will pick it up
+// when the node returns.
+func (d *DistributedBackendManager) enqueueAndDrainBackendOp(ctx context.Context, op, backend string, galleriesJSON []byte, apply func(node BackendNode) error) (BackendOpResult, error) {
+	allNodes, err := d.registry.List(ctx)
+	if err != nil {
+		return BackendOpResult{}, err
+	}
+
+	result := BackendOpResult{Nodes: make([]NodeOpStatus, 0, len(allNodes))}
+	for _, node := range allNodes {
+		// Pending nodes haven't been approved yet — no intent to apply.
+		if node.Status == StatusPending {
+			continue
+		}
+		if err := d.registry.UpsertPendingBackendOp(ctx, node.ID, backend, op, galleriesJSON); err != nil {
+			xlog.Warn("Failed to enqueue backend op", "op", op, "node", node.Name, "backend", backend, "error", err)
+			result.Nodes = append(result.Nodes, NodeOpStatus{
+				NodeID: node.ID, NodeName: node.Name, Status: "error",
+				Error: fmt.Sprintf("enqueue failed: %v", err),
+			})
+			continue
+		}
+
+		if node.Status != StatusHealthy {
+			// Intent is recorded; reconciler will retry when the node recovers.
+			result.Nodes = append(result.Nodes, NodeOpStatus{
+				NodeID: node.ID, NodeName: node.Name, Status: "queued",
+				Error: fmt.Sprintf("node %s, will retry when healthy", node.Status),
+			})
+			continue
+		}
+
+		applyErr := apply(node)
+		if applyErr == nil {
+			// Find the row we just upserted and delete it; cheap but requires
+			// a lookup since UpsertPendingBackendOp doesn't return the ID.
+			if err := d.deletePendingRow(ctx, node.ID, backend, op); err != nil {
+				xlog.Debug("Failed to clear pending backend op after success", "error", err)
+			}
+			result.Nodes = append(result.Nodes, NodeOpStatus{
+				NodeID: node.ID, NodeName: node.Name, Status: "success",
+			})
+			continue
+		}
+
+		// Record failure for backoff. If it's an ErrNoResponders, the node's
+		// gone AWOL — mark unhealthy so the router stops picking it too.
+		errMsg := applyErr.Error()
+		if errors.Is(applyErr, nats.ErrNoResponders) {
+			xlog.Warn("No NATS responders for node, marking unhealthy", "node", node.Name, "nodeID", node.ID)
+			d.registry.MarkUnhealthy(ctx, node.ID)
+		}
+		if id, err := d.findPendingRow(ctx, node.ID, backend, op); err == nil {
+			_ = d.registry.RecordPendingBackendOpFailure(ctx, id, errMsg)
+		}
+		result.Nodes = append(result.Nodes, NodeOpStatus{
+			NodeID: node.ID, NodeName: node.Name, Status: "error", Error: errMsg,
+		})
+	}
+	return result, nil
+}
+
+// findPendingRow looks up the ID of a pending_backend_ops row by its
+// composite key. Used to hand off to RecordPendingBackendOpFailure /
+// DeletePendingBackendOp after UpsertPendingBackendOp upserts by the same
+// composite key.
+func (d *DistributedBackendManager) findPendingRow(ctx context.Context, nodeID, backend, op string) (uint, error) {
+	var row PendingBackendOp
+	if err := d.registry.db.WithContext(ctx).
+		Where("node_id = ? AND backend = ? AND op = ?", nodeID, backend, op).
+		First(&row).Error; err != nil {
+		return 0, err
+	}
+	return row.ID, nil
+}
+
+// deletePendingRow removes the queue row keyed by (nodeID, backend, op).
+func (d *DistributedBackendManager) deletePendingRow(ctx context.Context, nodeID, backend, op string) error {
+	return d.registry.db.WithContext(ctx).
+		Where("node_id = ? AND backend = ? AND op = ?", nodeID, backend, op).
+		Delete(&PendingBackendOp{}).Error
+}
+
+// DeleteBackend fans out backend deletion to every known node. The previous
+// implementation silently skipped non-healthy nodes, which meant zombies
+// reappeared once those nodes returned. Now the intent is durable — see
+// enqueueAndDrainBackendOp — and the reconciler catches up later.
 func (d *DistributedBackendManager) DeleteBackend(name string) error {
-	// Try local deletion but ignore "not found" errors — in distributed mode
-	// the frontend node typically doesn't have backends installed locally;
-	// they only exist on worker nodes.
+	// Local delete first (frontend rarely has backends installed in
+	// distributed mode, but the gallery operation still expects it; ignore
+	// "not found" which is the common case).
 	if err := d.local.DeleteBackend(name); err != nil {
 		if !errors.Is(err, gallery.ErrBackendNotFound) {
 			return err
 		}
 		xlog.Debug("Backend not found locally, will attempt deletion on workers", "backend", name)
 	}
-	// Fan out backend.delete to all healthy nodes
-	allNodes, listErr := d.registry.List(context.Background())
-	if listErr != nil {
-		xlog.Warn("Failed to list nodes for backend deletion fan-out", "error", listErr)
-		return listErr
+
+	ctx := context.Background()
+	_, err := d.enqueueAndDrainBackendOp(ctx, OpBackendDelete, name, nil, func(node BackendNode) error {
+		_, err := d.adapter.DeleteBackend(node.ID, name)
+		return err
+	})
+	return err
+}
+
+// DeleteBackendDetailed is the per-node-result variant called by the HTTP
+// handler so the UI can render a per-node status drawer. DeleteBackend still
+// returns error-only for callers that don't care about node breakdown.
+func (d *DistributedBackendManager) DeleteBackendDetailed(ctx context.Context, name string) (BackendOpResult, error) {
+	if err := d.local.DeleteBackend(name); err != nil && !errors.Is(err, gallery.ErrBackendNotFound) {
+		return BackendOpResult{}, err
 	}
-	var errs []error
-	for _, node := range allNodes {
-		if node.Status != StatusHealthy {
-			continue
-		}
-		if _, delErr := d.adapter.DeleteBackend(node.ID, name); delErr != nil {
-			if errors.Is(delErr, nats.ErrNoResponders) {
-				// Node's NATS subscription is gone — likely restarted with a new ID.
-				// Mark it unhealthy so future fan-outs skip it.
-				xlog.Warn("No NATS responders for node, marking unhealthy", "node", node.Name, "nodeID", node.ID)
-				d.registry.MarkUnhealthy(context.Background(), node.ID)
-				continue
-			}
-			xlog.Warn("Failed to propagate backend deletion to worker", "node", node.Name, "backend", name, "error", delErr)
-			errs = append(errs, fmt.Errorf("node %s: %w", node.Name, delErr))
-		}
-	}
-	return errors.Join(errs...)
+	return d.enqueueAndDrainBackendOp(ctx, OpBackendDelete, name, nil, func(node BackendNode) error {
+		_, err := d.adapter.DeleteBackend(node.ID, name)
+		return err
+	})
 }
 
 // ListBackends aggregates installed backends from all worker nodes, preserving
@@ -170,69 +277,43 @@ func (d *DistributedBackendManager) ListBackends() (gallery.SystemBackends, erro
 	return result, nil
 }
 
-// InstallBackend fans out backend installation to all healthy worker nodes.
+// InstallBackend fans out installation through the pending-ops queue so
+// non-healthy nodes get retried when they come back instead of being silently
+// skipped. Reply success from the NATS round-trip deletes the queue row;
+// reply.Success==false is treated as an error so the row stays for retry.
 func (d *DistributedBackendManager) InstallBackend(ctx context.Context, op *galleryop.ManagementOp[gallery.GalleryBackend, any], progressCb galleryop.ProgressCallback) error {
-	allNodes, err := d.registry.List(context.Background())
-	if err != nil {
-		return err
-	}
-
 	galleriesJSON, _ := json.Marshal(op.Galleries)
 	backendName := op.GalleryElementName
 
-	for _, node := range allNodes {
-		if node.Status != StatusHealthy {
-			continue
-		}
+	_, err := d.enqueueAndDrainBackendOp(ctx, OpBackendInstall, backendName, galleriesJSON, func(node BackendNode) error {
 		reply, err := d.adapter.InstallBackend(node.ID, backendName, "", string(galleriesJSON))
 		if err != nil {
-			if errors.Is(err, nats.ErrNoResponders) {
-				xlog.Warn("No NATS responders for node, marking unhealthy", "node", node.Name, "nodeID", node.ID)
-				d.registry.MarkUnhealthy(context.Background(), node.ID)
-				continue
-			}
-			xlog.Warn("Failed to install backend on worker", "node", node.Name, "backend", backendName, "error", err)
-			continue
+			return err
 		}
 		if !reply.Success {
-			xlog.Warn("Backend install failed on worker", "node", node.Name, "backend", backendName, "error", reply.Error)
+			return fmt.Errorf("install failed: %s", reply.Error)
 		}
-	}
-	return nil
+		return nil
+	})
+	return err
 }
 
-// UpgradeBackend fans out a backend upgrade to all healthy worker nodes.
-// TODO: Add dedicated NATS subject for upgrade (currently reuses install with force flag)
+// UpgradeBackend reuses the install NATS subject (the worker re-downloads
+// from the gallery). Same queue semantics as Install/Delete.
 func (d *DistributedBackendManager) UpgradeBackend(ctx context.Context, name string, progressCb galleryop.ProgressCallback) error {
-	allNodes, err := d.registry.List(context.Background())
-	if err != nil {
-		return err
-	}
-
 	galleriesJSON, _ := json.Marshal(d.backendGalleries)
-	var errs []error
 
-	for _, node := range allNodes {
-		if node.Status != StatusHealthy {
-			continue
-		}
-		// Reuse install endpoint which will re-download the backend (force mode)
+	_, err := d.enqueueAndDrainBackendOp(ctx, OpBackendUpgrade, name, galleriesJSON, func(node BackendNode) error {
 		reply, err := d.adapter.InstallBackend(node.ID, name, "", string(galleriesJSON))
 		if err != nil {
-			if errors.Is(err, nats.ErrNoResponders) {
-				xlog.Warn("No NATS responders for node during upgrade, marking unhealthy", "node", node.Name, "nodeID", node.ID)
-				d.registry.MarkUnhealthy(context.Background(), node.ID)
-				continue
-			}
-			errs = append(errs, fmt.Errorf("node %s: %w", node.Name, err))
-			continue
+			return err
 		}
 		if !reply.Success {
-			errs = append(errs, fmt.Errorf("node %s: %s", node.Name, reply.Error))
+			return fmt.Errorf("upgrade failed: %s", reply.Error)
 		}
-	}
-
-	return errors.Join(errs...)
+		return nil
+	})
+	return err
 }
 
 // CheckUpgrades checks for available backend upgrades across the cluster.
